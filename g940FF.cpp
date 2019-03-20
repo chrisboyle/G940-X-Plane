@@ -27,6 +27,7 @@ XPLMDataRef pausedRef    = NULL;
 XPLMDataRef stallWarnRef = NULL;
 
 const double RADIANS_TO_FF_DIRECTION = 0x8000 / M_PI;
+const double KNOTS_TO_M_S = 0.51444444;
 
 int fd = -1;
 bool haveSpring = true;
@@ -34,6 +35,8 @@ struct ff_effect effect;
 struct input_event play, stop;
 
 #define ERROR_WAIT_SECS 5.0
+
+#define maxmag1(x) min(max(x, -1.0), 1.0)
 
 float flightLoopCallback(
 		float inElapsedSinceLastCall,
@@ -159,31 +162,30 @@ float flightLoopCallback(
 	double pitch     = XPLMGetDataf(pitchRef);
 	double roll      = XPLMGetDataf(rollRef);
 	double speed     = XPLMGetDataf(speedRef);
-	double vne       = XPLMGetDataf(vneRef) * 0.51444444;
+	double vne       = XPLMGetDataf(vneRef) * KNOTS_TO_M_S;
 	double alpha     = XPLMGetDataf(alphaRef);
 	double eTrim     = XPLMGetDataf(eTrimRef);
 	double aTrim     = XPLMGetDataf(aTrimRef);
 
-	double centerForce = -pitch - (alpha / 50) + eTrim;
-	double pitchForce = centerForce    * 1.5;
+	double pitchForce = (-pitch - (alpha / 50) + eTrim) * 1.5;
 	double rollForce = (-roll + aTrim) * 3.0;
 	double speedVne = min(speed / vne, 1.0);
 
 	if (haveSpring) {
 		double  xSat = 0x8000 * speedVne,
 			ySat = 0xffff * speedVne;
-		effect.u.condition[0].center = min(max(rollForce, -1.0), 1.0) * 0x7fff;
+		effect.u.condition[0].center = maxmag1(rollForce) * 0x7fff;
 		effect.u.condition[0].left_coeff       = 0x4000;
 		effect.u.condition[0].left_saturation  = xSat;
 		effect.u.condition[0].right_coeff      = 0x4000;
 		effect.u.condition[0].right_saturation = xSat;
-		effect.u.condition[1].center = min(max(pitchForce, -1.0), 1.0) * 0x7fff;
+		effect.u.condition[1].center = maxmag1(pitchForce) * 0x7fff;
 		effect.u.condition[1].left_coeff       = 0x4000;
 		effect.u.condition[1].left_saturation  = ySat;
 		effect.u.condition[1].right_coeff      = 0x4000;
 		effect.u.condition[1].right_saturation = ySat;
 	} else {
-		double totalForce = min(max(hypot(-rollForce, pitchForce) * speedVne, -1.0), 1.0);
+		double totalForce = maxmag1(hypot(-rollForce, pitchForce) * speedVne);
 		effect.u.constant.level = totalForce * 0x7fff;
 		double directionRadians = atan2(-rollForce, pitchForce);
 		effect.direction = directionRadians * RADIANS_TO_FF_DIRECTION;
