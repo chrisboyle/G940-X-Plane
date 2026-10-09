@@ -1,202 +1,146 @@
-#include <dirent.h>
-#include <fcntl.h>
-#include <math.h>
-#include <stdio.h>
+#include <cstdio>
+#include <cstring>
 #include <string>
-#include <string.h>
-#include <unistd.h>
-#include <linux/input.h>
+#ifdef G940_DEBUG_FORCE
+#include <chrono>
+#endif
+#include "XPLMPlugin.h"
 #include "XPLMDataAccess.h"
 #include "XPLMProcessing.h"
+#include "XPLMUtilities.h"
+#include "g940Backend.h"
+#include "g940ForceModel.h"
 
 #ifndef XPLM300
-	#error This is made to be compiled against the XPLM300 SDK
+#error This plugin requires the XPLM300 API
 #endif
 
-using namespace std;
+namespace {
+XPLMDataRef rollRef, pitchRef, speedRef, vneRef, alphaRef, eTrimRef, aTrimRef, pausedRef;
+bool enabled = false;
+bool forceReady = false;
+g940::ForceSmoother forceSmoother;
+#ifdef G940_DEBUG_FORCE
+std::chrono::steady_clock::time_point nextForceTrace;
+#endif
 
-XPLMDataRef rollRef      = NULL;
-XPLMDataRef pitchRef     = NULL;
-XPLMDataRef speedRef     = NULL;
-XPLMDataRef vneRef       = NULL;
-XPLMDataRef alphaRef     = NULL;
-XPLMDataRef eTrimRef     = NULL;
-XPLMDataRef aTrimRef     = NULL;
-XPLMDataRef gRef         = NULL;
-XPLMDataRef pausedRef    = NULL;
-XPLMDataRef stallWarnRef = NULL;
-
-const double RADIANS_TO_FF_DIRECTION = 0x8000 / M_PI;
-const double KNOTS_TO_M_S = 0.51444444;
-
-int fd = -1;
-bool haveSpring = true;
-struct ff_effect effect;
-struct input_event play, stop;
-
-#define ERROR_WAIT_SECS 5.0
-
-#define maxmag1(x) min(max(x, -1.0), 1.0)
-
-float flightLoopCallback(
-		float inElapsedSinceLastCall,
-		float inElapsedTimeSinceLastFlightLoop,
-		int   inCounter,
-		void *inRefcon);
-
-PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc)
-{
-	strcpy(outName, "cmb Force Feedback");
-	strcpy(outSig,  "name.boyle.chris.xpff");
-	strcpy(outDesc, "Connects X-Plane to Linux Force Feedback API.");
-
-	// TODO cache until XPLM_MSG_PLANE_LOADED
-	stallWarnRef = XPLMFindDataRef("sim/aircraft/overflow/acf_stall_warn_alpha");
-	vneRef       = XPLMFindDataRef("sim/aircraft/view/acf_Vne");
-
-	rollRef      = XPLMFindDataRef("sim/joystick/yoke_roll_ratio");
-	pitchRef     = XPLMFindDataRef("sim/joystick/yoke_pitch_ratio");
-	speedRef     = XPLMFindDataRef("sim/flightmodel/position/true_airspeed");
-	alphaRef     = XPLMFindDataRef("sim/flightmodel/position/alpha");
-	eTrimRef     = XPLMFindDataRef("sim/flightmodel2/controls/elevator_trim");
-	aTrimRef     = XPLMFindDataRef("sim/flightmodel2/controls/aileron_trim");
-
-	// TODO increase force if:
-	//servosRef  = XPLMFindDataRef("sim/cockpit2/autopilot/servos_on");
-
-	// TODO gear rumble:
-	// sim/flightmodel2/gear/on_noisy[0]
-	// sim/flightmodel/position/groundspeed
-
-	XPLMRegisterFlightLoopCallback(flightLoopCallback, 0.01, NULL);
-
-	printf("Force feedback initialised\n");
-	return 1;
+void reportError() {
+    const std::string message = std::string("G940 FF: ") + g940::backendError() + "\n";
+    XPLMDebugString(message.c_str());
 }
 
-PLUGIN_API void XPluginStop(void)
-{
-	if (fd > -1) {
-		write(fd, (const void*) &stop, sizeof(stop));
-		close(fd);
-		fd = -1;
-	}
+float flightLoopCallback(float elapsed, float, int, void *) {
+    if (!g940::prepareForceFeedback()) {
+        reportError(); forceReady = false; forceSmoother.reset(); return 5.0f;
+    }
+    if (XPLMGetDatai(pausedRef)) {
+        if (!forceReady) return 0.2f;
+#ifdef G940_DEBUG_FORCE
+        const bool startingRelease = !forceSmoother.releasing();
+#endif
+        const g940::ForceState state = forceSmoother.release(elapsed);
+        if (state.speedRatio <= 0.0f || state.effectScale <= 0.0f) {
+            if (!g940::releaseForceFeedback()) {
+                reportError(); g940::closeForceFeedback();
+            }
+            forceReady = false;
+            forceSmoother.reset();
+#ifdef G940_DEBUG_FORCE
+            XPLMDebugString("G940 FF trace: paused force released\n");
+#endif
+            return 0.2f;
+        }
+#ifdef G940_DEBUG_FORCE
+        if (startingRelease) XPLMDebugString("G940 FF trace: one-second pause fade started\n");
+#endif
+        if (!g940::updateForceFeedback(state)) {
+            reportError(); forceReady = false; forceSmoother.reset(); return 0.2f;
+        }
+        return 0.02f;
+    }
+    const bool startingForce = !forceReady;
+    if (startingForce) {
+        if (!g940::openForceFeedback()) { reportError(); return 5.0f; }
+        forceReady = true;
+        forceSmoother.reset();
+#ifdef G940_DEBUG_FORCE
+        nextForceTrace = std::chrono::steady_clock::time_point();
+#endif
+        XPLMDebugString("G940 FF: force-feedback device connected\n");
+    }
+    const float roll = XPLMGetDataf(rollRef), pitch = XPLMGetDataf(pitchRef);
+    const float speed = XPLMGetDataf(speedRef), vne = XPLMGetDataf(vneRef);
+    const float alpha = XPLMGetDataf(alphaRef);
+    const float elevatorTrim = XPLMGetDataf(eTrimRef), aileronTrim = XPLMGetDataf(aTrimRef);
+    const g940::ForceState target = g940::calculateForce(
+        roll, pitch, speed, vne, alpha, elevatorTrim, aileronTrim);
+    if (startingForce) forceSmoother.reset(target);
+    const g940::ForceState state = forceSmoother.update(target, elapsed);
+#ifdef G940_DEBUG_FORCE
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= nextForceTrace) {
+        char message[384];
+        std::snprintf(message, sizeof(message),
+            "G940 FF trace: TAS=%.2f m/s Vne=%.2f kt ratio=%.3f "
+            "yoke=(%.3f,%.3f) trim=(%.3f,%.3f) alpha=%.2f centers=(%.3f,%.3f) "
+            "spring=(%.3f,%.3f) scale=%.3f\n",
+            speed, vne, state.speedRatio, roll, pitch, aileronTrim, elevatorTrim,
+            alpha, state.roll, state.pitch,
+            g940::springSaturationRatio(state.speedRatio, 0) * state.effectScale,
+            g940::springSaturationRatio(state.speedRatio, 1) * state.effectScale,
+            state.effectScale);
+        XPLMDebugString(message);
+        nextForceTrace = now + std::chrono::seconds(2);
+    }
+#endif
+    if (!g940::updateForceFeedback(state)) {
+        reportError(); forceReady = false; return 5.0f;
+    }
+    return 0.02f;
+}
 }
 
-PLUGIN_API void XPluginDisable(void) {}
-PLUGIN_API int  XPluginEnable(void)  { return 1; }
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, int inMsg, void * inParam) {}
-
-void openJoystick(const string& path)
-{
-	fd = open(path.c_str(), O_RDWR);
-	if (fd < 0) {
-		return;
-	}
-
-	haveSpring = true;
-	memset(&effect, 0, sizeof(effect));
-	effect.id = -1;
-	effect.direction = 0;
-	effect.type = FF_SPRING;
-	if (ioctl(fd, EVIOCSFF, &effect) == -1) {
-		haveSpring = false;
-		effect.type = FF_CONSTANT;
-		effect.u.constant.level = 0;
-		if (ioctl(fd, EVIOCSFF, &effect) == -1) {
-			perror((path + " ioctl").c_str());
-			close(fd);
-			fd = -1;
-			return;
-		}
-	}
-
-	memset(&play, 0, sizeof(play));
-	play.type = EV_FF;
-	play.code = effect.id;
-	play.value = 1;
-
-	memset(&stop, 0, sizeof(stop));
-	stop.type = EV_FF;
-	stop.code = effect.id;
-	stop.value = 0;
-
-	if (write(fd, (const void*) &play, sizeof(play)) == -1) {
-		perror("Play effect");
-		close(fd);
-		fd = -1;
-		return;
-	}
+PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
+    std::strcpy(outName, "G940 Force Feedback");
+    std::strcpy(outSig, "name.boyle.chris.xpff");
+    std::strcpy(outDesc, "Connects X-Plane to force-feedback hardware.");
+    struct Reference { XPLMDataRef *target; const char *name; };
+    const Reference references[] = {
+        {&rollRef, "sim/joystick/yoke_roll_ratio"},
+        {&pitchRef, "sim/joystick/yoke_pitch_ratio"},
+        {&speedRef, "sim/flightmodel/position/true_airspeed"},
+        {&vneRef, "sim/aircraft/view/acf_Vne"},
+        {&alphaRef, "sim/flightmodel/position/alpha"},
+        {&eTrimRef, "sim/flightmodel2/controls/elevator_trim"},
+        {&aTrimRef, "sim/flightmodel2/controls/aileron_trim"},
+        {&pausedRef, "sim/time/paused"}
+    };
+    for (const auto& reference : references) {
+        *reference.target = XPLMFindDataRef(reference.name);
+        if (!*reference.target) {
+            XPLMDebugString("G940 FF: required dataref missing: ");
+            XPLMDebugString(reference.name); XPLMDebugString("\n");
+            return 0;
+        }
+    }
+    return 1;
 }
 
-void findJoystick()
-{
-	DIR *dir;
-	struct dirent *ent;
-	string inputPath = "/dev/input/";
-
-	if ((dir = opendir(inputPath.c_str())) == NULL) {
-		perror((string("open ") + inputPath).c_str());
-		return;
-	}
-	while (fd < 0 && (ent = readdir(dir)) != NULL) {
-		openJoystick(inputPath + ent->d_name);
-	}
-	closedir(dir);
+PLUGIN_API int XPluginEnable() {
+    if (!enabled) {
+        XPLMRegisterFlightLoopCallback(flightLoopCallback, 0.01f, nullptr);
+        enabled = true;
+    }
+    return 1;
 }
 
-float flightLoopCallback(
-		float  inElapsedSinceLastCall,
-		float  inElapsedTimeSinceLastFlightLoop,
-		int    inCounter,
-		void * inRefcon)
-{
-	if (fd < 0) {
-		findJoystick();
-		if (fd < 0) {
-			perror("Can't open joystick");
-			return ERROR_WAIT_SECS;
-		}
-	}
-
-	double pitch     = XPLMGetDataf(pitchRef);
-	double roll      = XPLMGetDataf(rollRef);
-	double speed     = XPLMGetDataf(speedRef);
-	double vne       = XPLMGetDataf(vneRef) * KNOTS_TO_M_S;
-	double alpha     = XPLMGetDataf(alphaRef);
-	double eTrim     = XPLMGetDataf(eTrimRef);
-	double aTrim     = XPLMGetDataf(aTrimRef);
-
-	double pitchForce = (-pitch - (alpha / 50) + eTrim) * 1.5;
-	double rollForce = (-roll + aTrim) * 3.0;
-	double speedVne = min(speed / vne, 1.0);
-
-	if (haveSpring) {
-		double  xSat = 0x8000 * speedVne,
-			ySat = 0xffff * speedVne;
-		effect.u.condition[0].center = maxmag1(rollForce) * 0x7fff;
-		effect.u.condition[0].left_coeff       = 0x4000;
-		effect.u.condition[0].left_saturation  = xSat;
-		effect.u.condition[0].right_coeff      = 0x4000;
-		effect.u.condition[0].right_saturation = xSat;
-		effect.u.condition[1].center = maxmag1(pitchForce) * 0x7fff;
-		effect.u.condition[1].left_coeff       = 0x4000;
-		effect.u.condition[1].left_saturation  = ySat;
-		effect.u.condition[1].right_coeff      = 0x4000;
-		effect.u.condition[1].right_saturation = ySat;
-	} else {
-		double totalForce = maxmag1(hypot(-rollForce, pitchForce) * speedVne);
-		effect.u.constant.level = totalForce * 0x7fff;
-		double directionRadians = atan2(-rollForce, pitchForce);
-		effect.direction = directionRadians * RADIANS_TO_FF_DIRECTION;
-	}
-
-	if (ioctl(fd, EVIOCSFF, &effect) == -1) {
-		perror("Updating effect");
-		close(fd);
-		fd = -1;
-	}
-
-	return 0.02;
+PLUGIN_API void XPluginDisable() {
+    if (enabled) XPLMUnregisterFlightLoopCallback(flightLoopCallback, nullptr);
+    enabled = false;
+    if (!g940::closeForceFeedback()) reportError();
+    forceReady = false;
+    forceSmoother.reset();
 }
 
+PLUGIN_API void XPluginStop() { XPluginDisable(); }
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void *) {}

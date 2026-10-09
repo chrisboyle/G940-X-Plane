@@ -1,4 +1,6 @@
 /build/
 /SDK/
 /XPSDK*.zip
+/XPSDK*.zip.tmp
+__pycache__/
 *~

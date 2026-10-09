@@ -1,7 +1,5 @@
 {
  global:
-  _init;
-  _fini;
   XPluginStart;
   XPluginStop;
   XPluginEnable;
@@ -10,4 +8,3 @@
  local:
    *;
 };
-
